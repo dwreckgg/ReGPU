@@ -178,6 +178,18 @@ void LogCrashContext();
 void SetGameWidescreen(bool on);
 // Call when the game has stopped drawing (the window is closing): flushes the shader and pipeline caches.
 void SaveCaches();
+// For a host that shuts down while ReGPU's threads still run: call this before the guest's memory and
+// threads go away. When it returns, no interrupt callback is running in guest code and none will be
+// started; interrupts raised later are dropped. It also ends the periodic shader scan of guest memory:
+// no scan pass is running and none will start. It waits at most waitMs milliseconds in all for a
+// callback and a scan pass in flight (a callback stuck in guest code must not hang the host's shutdown)
+// and returns whether neither was left running. Calling it again is harmless. Not to be called from
+// inside a callback. After it returns ReGPU is not idle: every thread acting on work already queued
+// can still read or write guest memory for it, among them the command processor, the draw workers, the
+// fence writer and the texture prehash workers (and, with their debug switches, the overwrite checker
+// and the debug server), and the host callbacks (onSwap, resolveWriteback and the others) can still be
+// called, among them logThreadStacks from the hang watchdog once no frame has been swapped for 10 s.
+bool StopInterrupts(uint32_t waitMs = 500);
 // The output (drawing) resolution while the game runs: Config's width and height at start. Taken at
 // the start of the next frame (the host GPU idle; surfaces, upscaler and swap chain rebuilt). The
 // upscaler and its quality (Config::upscaler, quality) are read every frame and change without it.

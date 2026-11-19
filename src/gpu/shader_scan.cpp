@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -31,6 +32,16 @@ std::mutex g_mutex;
 std::unordered_set<uint64_t> g_seen;
 std::vector<ScannedShader> g_found;
 std::atomic<uint64_t> g_totalFound{ 0 };
+
+// regpu::StopInterrupts ends the scan too: the stop, and the passes counted in (ShaderScanNow).
+// Sequentially consistent on both sides, as for the interrupt dispatches: a pass either sees the stop
+// and reads nothing, or the stop sees it counted and waits for it. A pass in flight tests the stop
+// every few megabytes and leaves. g_stopCv wakes the stop when the count falls, under g_stopMutex.
+std::atomic<bool> g_stopped{ false };
+std::atomic<uint32_t> g_passes{ 0 };
+std::mutex g_stopMutex;
+std::condition_variable g_stopCv;
+constexpr uint32_t kStopTestWords = 0x100000; // 4 MB between tests of the stop
 
 uint64_t Fnv(const uint32_t* p, size_t n)
 {
@@ -69,6 +80,8 @@ void ScanRange(uint32_t begin, uint32_t end, std::vector<ScannedShader>& out)
 {
     for (uint32_t offset = begin; offset < end;)
     {
+        if (g_stopped.load())
+            return;
         uint32_t next = end;
         const uint32_t stop = ReadableEnd(offset, end, &next);
         // (A shader's header reads 3 words ahead and its code up to its size: both stay within
@@ -86,6 +99,8 @@ void ScanWords(uint32_t first, uint32_t runEnd, std::vector<ScannedShader>& out)
     const uint32_t last = count >= 3 ? count - 3 : 0;
     for (uint32_t i = first; i < last; i++)
     {
+        if ((i - first) % kStopTestWords == 0 && g_stopped.load())
+            return; // regpu::StopInterrupts: no read after this
         const uint32_t w = words[i];
         // Big-endian bytes C0..C3, count low, 2B, 00 read as a little-endian word.
         if ((w & 0xFFFF00FC) != 0x002B00C0)
@@ -116,6 +131,22 @@ void ScanWords(uint32_t first, uint32_t runEnd, std::vector<ScannedShader>& out)
 
 void ShaderScanNow(unsigned threads)
 {
+    // Counted in before the stop test and out after the workers joined (on every exit), so the whole
+    // pass is either waited for by ShaderScanWaitStopped or never started.
+    g_passes.fetch_add(1);
+    struct CountOut
+    {
+        ~CountOut()
+        {
+            if (g_passes.fetch_sub(1) == 1 && g_stopped.load())
+            {
+                std::lock_guard lock(g_stopMutex);
+                g_stopCv.notify_all();
+            }
+        }
+    } countOut;
+    if (g_stopped.load())
+        return;
     threads = std::clamp(threads, 1u, 16u);
     std::vector<std::vector<ScannedShader>> results(threads);
     std::vector<std::thread> workers;
@@ -143,9 +174,22 @@ void ShaderScanStart()
         for (;;)
         {
             Sleep(1500);
+            if (g_stopped.load())
+                return; // regpu::StopInterrupts: the thread ends
             ShaderScanNow(1);
         }
     }).detach();
+}
+
+void ShaderScanStop()
+{
+    g_stopped.store(true);
+}
+
+bool ShaderScanWaitStopped(std::chrono::steady_clock::time_point deadline)
+{
+    std::unique_lock lock(g_stopMutex);
+    return g_stopCv.wait_until(lock, deadline, [] { return g_passes.load() == 0; });
 }
 
 bool ShaderScanTake(std::vector<ScannedShader>& out, size_t maxCount)

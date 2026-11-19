@@ -79,6 +79,17 @@ regpu::Start();   // window, device, command processor
 Your runtime already has these: they are the pieces any XenonRecomp port builds for its own threads
 and memory. ReGPU never touches the rest of the kernel (files, threads, XAM, audio), which stays yours.
 
+ReGPU's threads run until the process exits. A host that frees the guest's memory or threads while
+the process lives on (a shutdown) calls `regpu::StopInterrupts()` first: when it returns, no graphics
+interrupt callback is running in guest code and none will start, and the periodic shader scan of
+guest memory has ended (it waits up to `waitMs` in all, 500 ms by default, for a callback and a scan
+pass in flight, and returns false if either was still running then). ReGPU is not idle afterwards:
+every thread acting on work already queued can still read or write guest memory for it, among them
+the command processor, the draw workers, the fence writer and the texture prehash workers (and, with
+their debug switches, the overwrite checker and the debug server), and the host callbacks (`onSwap`,
+`resolveWriteback` and the others) can still be called, among them `logThreadStacks` from the hang
+watchdog once no frame has been swapped for 10 s. Without the call nothing changes.
+
 The renderer currently assumes the game draws at 1280x720, as most Xbox 360 games do (see
 [`docs/xenos-notes.md`](docs/xenos-notes.md)).
 
